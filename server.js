@@ -236,6 +236,36 @@ function buildInventorySummary() {
   return lines;
 }
 
+// Compact identify-only summary: only the fields a caller uses to name a car
+// verbally (make, model, color, year, reg, price). Keeps the identify call
+// payload small (~1,300 tokens for 100 cars vs ~3,600 for the full summary).
+function buildIdentifySummary() {
+  return cars.map((c) => {
+    const a = ad(c);
+    if (!a) return null;
+    const v = a.vehicle || {};
+    return `id=${a.id} ${v.year || '?'} ${v.color || ''} ${v.make || ''} ${v.model || ''} reg=${v.registration_number || '?'} ${priceText(c) || ''}`
+      .replace(/ +/g, ' ').trim();
+  }).filter(Boolean).join('\n');
+}
+
+// Memoized accessors — both summaries are computed once at startup and reused
+// across all turns and all concurrent sessions. Invalidated on car updates.
+let _inventorySummaryCache = null;
+let _identifySummaryCache  = null;
+function getInventorySummary() {
+  if (!_inventorySummaryCache) _inventorySummaryCache = buildInventorySummary();
+  return _inventorySummaryCache;
+}
+function getIdentifySummary() {
+  if (!_identifySummaryCache) _identifySummaryCache = buildIdentifySummary();
+  return _identifySummaryCache;
+}
+function invalidateSummaryCache() {
+  _inventorySummaryCache = null;
+  _identifySummaryCache  = null;
+}
+
 // The detailed fact sheet for a single matched car, used once the model has
 // locked in which vehicle the caller is asking about.
 function buildMatchedCarFacts(car) {
@@ -301,7 +331,7 @@ function buildReplySystemPrompt(session) {
       `\nAnswer the caller's questions using the facts above. When they ask about "damages" or "condition", use the accident-free flag and previous-owners count as the honest basis.`;
   } else {
     base += `\n\nFull vehicle inventory (${cars.length} vehicles). Use this to identify which car the caller is asking about, and to answer their questions. If the caller mentions any identifying detail — registration number, make, model, color, price, year — find the matching car in this list and answer from its row:\n\n` +
-      buildInventorySummary() +
+      getInventorySummary() +
       `\n\nIf only one vehicle reasonably matches the caller's description, treat it as the one they mean and answer from its row. Only ask "which car" if multiple rows genuinely match.`;
   }
   return base;
@@ -310,25 +340,31 @@ function buildReplySystemPrompt(session) {
 // Pre-reply car identification: ask a small JSON-only call to pull any car
 // clues out of the full transcript, then match them against the inventory.
 // Runs on every turn until a car is locked in.
-async function identifyCarFromTranscript(session) {
+// transcriptTxt is optional — callers that already built the string pass it in
+// so we avoid re-reading session.history and avoid the push/pop mutation dance.
+async function identifyCarFromTranscript(session, transcriptTxt) {
   if (!openai) return null;
   if (session.matchedCar) return session.matchedCar;
   if (!cars.length) return null;
 
-  const transcriptTxt = session.history
+  // Use the provided transcript or fall back to building it from history.
+  const txt = transcriptTxt ?? session.history
     .filter((h) => h.role === 'user' || h.role === 'assistant')
     .map((h) => `${h.role === 'user' ? 'Caller' : 'AI'}: ${h.content}`)
     .join('\n');
-  if (!transcriptTxt.trim()) return null;
+  if (!txt.trim()) return null;
 
-  const inventorySummary = buildInventorySummary();
-
+  // Inventory is placed in the system message so the stable prefix is eligible
+  // for OpenAI's automatic prompt caching (requires ≥1024-token prefix,
+  // identical across calls). The transcript goes in the user message — it
+  // changes every turn and must NOT be cached.
   const sys =
     `You match a phone caller's spoken request to a specific vehicle in a car dealership's inventory. ` +
     `Return ONLY valid minified JSON: {"car_id":"<ad_id or empty>","confidence":<0..1>,"brand":"","model":"","color":"","year":null,"price":null,"registration_number":""}. ` +
-    `Put the ad_id of the best-matching row in car_id if you can identify it with reasonable confidence (>=0.5). Otherwise leave car_id empty and fill whatever clues you have. No markdown, no commentary.`;
+    `Put the ad_id of the best-matching row in car_id if you can identify it with reasonable confidence (>=0.5). Otherwise leave car_id empty and fill whatever clues you have. No markdown, no commentary.\n\n` +
+    `Inventory:\n${getIdentifySummary()}`;
 
-  const user = `Inventory:\n${inventorySummary}\n\nTranscript so far:\n${transcriptTxt}`;
+  const user = `Transcript so far:\n${txt}`;
 
   try {
     const t0 = Date.now();
@@ -473,29 +509,59 @@ async function speakToCaller(session, text) {
       input: text,
       response_format: 'pcm',
     });
-    const pcm24 = Buffer.from(await ttsResp.arrayBuffer());
-    log('info', 'tts', `tts synthesized ${pcm24.length} bytes in ${Date.now() - t0}ms`, { session_id: session.id });
+    log('info', 'tts', `tts response started in ${Date.now() - t0}ms — streaming`, { session_id: session.id });
 
-    const pcm16 = resample24to16(pcm24);
-    log('info', 'tts', `resampled to ${pcm16.length} bytes (16kHz)`, { session_id: session.id });
-
-    const CHUNK = 640; // 20ms at 16kHz 16-bit mono
+    // Stream TTS audio to Vonage as it arrives instead of buffering the full
+    // response. This cuts the dead-silence window from ~2-5s to ~300-500ms.
     session.playbackAborted = false;
-
     let bargedIn = false;
-    for (let i = 0; i < pcm16.length; i += CHUNK) {
+    let leftover = null;           // carry buffer: PCM samples are 2 bytes wide,
+                                   // network chunks may arrive with odd byte count
+    let sendBuf = Buffer.alloc(0); // accumulates resampled 16kHz PCM frames
+
+    for await (const rawChunk of ttsResp.body) {
       if (session.playbackAborted) { bargedIn = true; break; }
-      if (!session.ws || session.ws.readyState !== WebSocket.OPEN) break;
-      let chunk = pcm16.subarray(i, i + CHUNK);
-      if (chunk.length < CHUNK) {
-        const padded = Buffer.alloc(CHUNK);
-        chunk.copy(padded);
-        chunk = padded;
+      if (!session.ws || session.ws.readyState !== WebSocket.OPEN) { bargedIn = true; break; }
+
+      // Prepend any leftover byte to maintain 2-byte sample alignment.
+      let chunk24 = leftover
+        ? Buffer.concat([leftover, Buffer.from(rawChunk)])
+        : Buffer.from(rawChunk);
+      if (chunk24.length % 2 !== 0) {
+        leftover = chunk24.slice(chunk24.length - 1);
+        chunk24  = chunk24.slice(0, chunk24.length - 1);
+      } else {
+        leftover = null;
       }
-      try { session.ws.send(chunk, { binary: true }); }
-      catch (e) { log('warn', 'websocket', `send failed: ${e.message}`, { session_id: session.id }); break; }
-      await sleep(20);
+
+      if (chunk24.length > 0) {
+        sendBuf = Buffer.concat([sendBuf, resample24to16(chunk24)]);
+      }
+
+      // Drain sendBuf in 640-byte Vonage frames (20ms at 16kHz 16-bit mono).
+      while (sendBuf.length >= 640) {
+        if (session.playbackAborted) { bargedIn = true; break; }
+        const frame = sendBuf.subarray(0, 640);
+        sendBuf = Buffer.from(sendBuf.subarray(640));
+        try { session.ws.send(frame, { binary: true }); }
+        catch (e) {
+          log('warn', 'websocket', `send failed: ${e.message}`, { session_id: session.id });
+          bargedIn = true; break;
+        }
+        await sleep(20);
+      }
+      if (bargedIn) break;
     }
+
+    // Flush any remaining bytes in sendBuf (pad the last frame to 640 bytes).
+    if (!bargedIn && sendBuf.length > 0) {
+      const padded = Buffer.alloc(640);
+      sendBuf.copy(padded);
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        try { session.ws.send(padded, { binary: true }); } catch {}
+      }
+    }
+
     log('info', 'tts', bargedIn ? `playback aborted (barge-in)` : `playback complete`, { session_id: session.id });
   } catch (e) {
     log('error', 'tts', `tts failed: ${e.message}`, { session_id: session.id });
@@ -683,18 +749,32 @@ async function runTurn(session, userText) {
   persistCall(session);
 
   try {
-    // Identify car if not yet matched.
-    session.history.push({ role: 'user', content: userText });
-    if (!session.matchedCar) {
-      const identified = await identifyCarFromTranscript(session);
-      if (identified) {
-        session.matchedCar = identified;
-        broadcast({ type: 'session', session: serializeSession(session) });
-      }
-    }
-    session.history.pop();
+    // Build transcript text once so both parallel calls share it without
+    // mutating session.history (avoids the old push/pop dance).
+    const transcriptForIdentify = [
+      ...session.history,
+      { role: 'user', content: userText },
+    ]
+      .filter((h) => h.role === 'user' || h.role === 'assistant')
+      .map((h) => `${h.role === 'user' ? 'Caller' : 'AI'}: ${h.content}`)
+      .join('\n');
 
-    const reply = await generateReply(session, userText);
+    // Identify the car and generate the reply in parallel.
+    // generateReply already includes the full inventory in its system prompt
+    // when no car is matched, so it can answer correctly without waiting for
+    // the identify result. The match is stored for the *next* turn's prompt.
+    const [identified, reply] = await Promise.all([
+      session.matchedCar
+        ? Promise.resolve(null)
+        : identifyCarFromTranscript(session, transcriptForIdentify),
+      generateReply(session, userText),
+    ]);
+
+    if (identified) {
+      session.matchedCar = identified;
+      log('info', 'inventory', `car matched: ${carId(identified)}`, { session_id: session.id });
+      broadcast({ type: 'session', session: serializeSession(session) });
+    }
 
     const ts = new Date().toISOString();
     session.transcript.push({ speaker: 'ai', text: reply, ts });
