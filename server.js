@@ -911,11 +911,6 @@ app.all('/api/vonage/answer', (req, res) => {
   const wsBase = BASE_URL.replace(/^http/i, 'ws').replace(/\/$/, '');
   const ncco = [
     {
-      action: 'talk',
-      text: "Hello, thanks for calling. Our salesperson is unavailable right now, but I can help you. Which car are you interested in?",
-      language: 'en-US',
-    },
-    {
       action: 'connect',
       from: 'NexmoDTMF',
       endpoint: [
@@ -1067,6 +1062,38 @@ function handleVonageWS(ws, req, url) {
   persistCall(session);
 
   openElevenStream(session);
+
+  // Speak the greeting via OpenAI TTS on the Vonage WebSocket. This uses the
+  // same turn-taking machinery as any other AI utterance: the turn is
+  // "speaking" during playback, barge-in aborts it, and the greeting is
+  // recorded in the transcript + conversation history so the model knows
+  // what it said.
+  const GREETING = "Hello, thanks for calling. This is Honeybadger car dealership. How can I can help you?";
+  ws.on('open', () => {}); // noop
+  // The ws is already open by the time handleVonageWS is called (upgrade
+  // handler completed). Fire the greeting on next tick so session setup
+  // finishes first.
+  setImmediate(async () => {
+    if (session.turn !== 'idle') return;
+    session.turn = 'speaking';
+    broadcast({ type: 'session', session: serializeSession(session) });
+    const ts = new Date().toISOString();
+    session.transcript.push({ speaker: 'ai', text: GREETING, ts });
+    session.history.push({ role: 'assistant', content: GREETING });
+    broadcast({ type: 'transcript', call_id: session.id, entry: { speaker: 'ai', text: GREETING, ts } });
+    persistCall(session);
+    try {
+      await speakToCaller(session, GREETING);
+    } catch (e) {
+      log('error', 'tts', `greeting failed: ${e.message}`, { session_id: session.id });
+    } finally {
+      session.turn = 'idle';
+      broadcast({ type: 'session', session: serializeSession(session) });
+      if ((session.pendingUtterance || '').trim()) {
+        setTimeout(() => decideAndMaybeFlush(session), 100);
+      }
+    }
+  });
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
