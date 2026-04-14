@@ -500,6 +500,10 @@ async function speakToCaller(session, text) {
   } catch (e) {
     log('error', 'tts', `tts failed: ${e.message}`, { session_id: session.id });
   }
+  // Mute inbound audio for 300ms after playback so residual acoustic echo
+  // from the phone doesn't reach ElevenLabs STT and produce a false transcript.
+  session.suppressAudio = true;
+  setTimeout(() => { session.suppressAudio = false; }, 300);
   // NOTE: turn state is reset by runTurn's finally block, not here.
 }
 
@@ -904,6 +908,13 @@ function sendAudioChunkToEleven(session, pcmBuffer) {
 
 function forwardAudioToEleven(session, frame) {
   if (!session.elevenWS) return;
+  // While the AI is speaking, Vonage echoes the TTS audio back as inbound
+  // audio. Forwarding it to ElevenLabs causes the STT to transcribe the AI's
+  // own voice as caller speech, triggering false barge-ins or committed
+  // transcripts that make the AI reply to itself. Gate it out entirely.
+  // suppressAudio extends the gate for 300ms after speech ends to let any
+  // residual acoustic echo from the phone decay before STT resumes.
+  if (session.turn === 'speaking' || session.suppressAudio) return;
   if (!session.sttReady) {
     if (session.sttPending) session.sttPending.push(frame);
     return;
@@ -1071,6 +1082,7 @@ function handleVonageWS(ws, req, url) {
     matchedCar: null,
     interim: '',
     playbackAborted: false,
+    suppressAudio: false,
     finalized: false,
     pendingUtterance: '',
     pendingTimer: null,
