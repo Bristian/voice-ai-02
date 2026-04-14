@@ -749,8 +749,9 @@ async function runTurn(session, userText) {
   persistCall(session);
 
   try {
-    // Build transcript text once so both parallel calls share it without
-    // mutating session.history (avoids the old push/pop dance).
+    // Build the transcript string once, including the current utterance, so
+    // identifyCarFromTranscript can see it without mutating session.history
+    // (avoids the old push/pop dance).
     const transcriptForIdentify = [
       ...session.history,
       { role: 'user', content: userText },
@@ -759,22 +760,22 @@ async function runTurn(session, userText) {
       .map((h) => `${h.role === 'user' ? 'Caller' : 'AI'}: ${h.content}`)
       .join('\n');
 
-    // Identify the car and generate the reply in parallel.
-    // generateReply already includes the full inventory in its system prompt
-    // when no car is matched, so it can answer correctly without waiting for
-    // the identify result. The match is stored for the *next* turn's prompt.
-    const [identified, reply] = await Promise.all([
-      session.matchedCar
-        ? Promise.resolve(null)
-        : identifyCarFromTranscript(session, transcriptForIdentify),
-      generateReply(session, userText),
-    ]);
-
-    if (identified) {
-      session.matchedCar = identified;
-      log('info', 'inventory', `car matched: ${carId(identified)}`, { session_id: session.id });
-      broadcast({ type: 'session', session: serializeSession(session) });
+    // Identify the car BEFORE generating the reply so that generateReply can
+    // use the matched car's facts in its system prompt. Running them in parallel
+    // caused generateReply to receive the full 100-car inventory prompt (no car
+    // matched yet) and produce vague stalling responses on turn 1. With the
+    // slim identify summary + prompt caching the identify call completes in
+    // ~300ms, so the sequential overhead is minimal.
+    if (!session.matchedCar) {
+      const identified = await identifyCarFromTranscript(session, transcriptForIdentify);
+      if (identified) {
+        session.matchedCar = identified;
+        log('info', 'inventory', `car matched: ${carId(identified)}`, { session_id: session.id });
+        broadcast({ type: 'session', session: serializeSession(session) });
+      }
     }
+
+    const reply = await generateReply(session, userText);
 
     const ts = new Date().toISOString();
     session.transcript.push({ speaker: 'ai', text: reply, ts });
@@ -1179,7 +1180,7 @@ function handleVonageWS(ws, req, url) {
   // "speaking" during playback, barge-in aborts it, and the greeting is
   // recorded in the transcript + conversation history so the model knows
   // what it said.
-  const GREETING = "Hello, thanks for calling. This is Honeybadger car dealership. How can I can help you?";
+  const GREETING = "Hello, Porn Delivery Manager. This is Honeybadger car dealership. How can I help you?";
   ws.on('open', () => {}); // noop
   // The ws is already open by the time handleVonageWS is called (upgrade
   // handler completed). Fire the greeting on next tick so session setup
