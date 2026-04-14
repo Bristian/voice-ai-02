@@ -196,47 +196,166 @@ function matchCarFromClues(clues) {
 // ---------------------------------------------------------------------------
 // OpenAI helpers
 // ---------------------------------------------------------------------------
-function buildReplySystemPrompt(session) {
-  const car = session.matchedCar;
-  let base = `You are a professional, polite assistant for a car dealership. Speak naturally and briefly — one or two short sentences per reply. Help the customer, gather their intent, ask clarifying questions when needed, and be useful. Do not list prices or specifications unless asked.`;
 
-  const a = ad(car);
-  if (a) {
+// A compact inventory summary the model can use to ANSWER questions directly
+// when no specific car has been locked in yet. Every car gets one line with
+// its key identifying attributes so the model can find a match from natural
+// language like "the Ford Focus" or "the black Audi".
+function buildInventorySummary() {
+  const lines = cars.map((c) => {
+    const a = ad(c);
+    if (!a) return null;
     const v = a.vehicle || {};
     const loc = a.location || {};
-    const meta = a.seller_metadata || {};
-    const statusLine = a.ad_status === 'active'
-      ? 'Available for sale'
-      : (a.ad_status === 'reserved' ? 'Reserved (deposit taken, may still fall through)'
-        : (a.ad_status === 'sold' ? 'Sold' : `Status: ${a.ad_status}`));
+    const status = a.ad_status === 'active' ? 'available'
+      : a.ad_status === 'reserved' ? 'reserved'
+      : a.ad_status === 'sold' ? 'sold'
+      : (a.ad_status || 'unknown');
+    return `- id=${a.id} | ${v.year || '?'} ${v.color || ''} ${v.make || ''} ${v.model || ''} ${v.variant || ''} | reg=${v.registration_number || '?'} | ${priceText(c) || 'price on request'} | ${v.mileage_km != null ? v.mileage_km + 'km' : 'mileage unknown'} | ${v.fuel || '?'}, ${v.transmission || '?'} | ${v.engine_power_hp || '?'}hp | ${loc.postal_name || loc.municipality || ''} | ${status}`
+      .replace(/ +/g, ' ');
+  }).filter(Boolean).join('\n');
+  return lines;
+}
 
-    base += `\n\nThe customer is asking about this vehicle from our inventory:\n` +
-      `- Listing: ${a.heading}\n` +
-      `- ${v.year || '?'} ${v.color || ''} ${v.make || ''} ${v.model || ''} ${v.variant || ''}\n`.replace(/ +/g, ' ') +
-      `- Registration: ${v.registration_number || 'unknown'}\n` +
-      `- Price: ${priceText(car) || 'on request'}\n` +
-      `- Mileage: ${v.mileage_km != null ? v.mileage_km + ' km' : 'unknown'}\n` +
-      `- Fuel: ${v.fuel || 'unknown'}, Transmission: ${v.transmission || 'unknown'}, Drivetrain: ${v.drivetrain || 'unknown'}\n` +
-      `- Body type: ${v.body_type || 'unknown'}, Doors: ${v.doors || '?'}, Seats: ${v.seats || '?'}\n` +
-      `- Power: ${v.engine_power_hp || '?'} hp (${v.engine_power_kw || '?'} kW), Engine: ${v.engine_size_cc || '?'} cc\n` +
-      `- Fuel consumption: ${v.consumption_l_100km != null ? v.consumption_l_100km + ' L/100km' : 'unknown'}, CO₂: ${v.co2_g_km != null ? v.co2_g_km + ' g/km' : 'unknown'}\n` +
-      `- Emission class: ${v.emission_class || 'unknown'}\n` +
-      `- Inspection valid until: ${v.inspection_valid_until || 'unknown'}\n` +
-      `- Annual tax: ${v.tax_annual_sek != null ? v.tax_annual_sek + ' SEK' : 'unknown'}\n` +
-      `- Towbar: ${v.towbar ? 'yes' : 'no'}, Service book: ${v.service_book ? 'yes' : 'no'}, Winter tires: ${v.winter_tires ? 'yes' : 'no'}, Summer tires: ${v.summer_tires ? 'yes' : 'no'}\n` +
-      `- Previous owners: ${meta.owners_count != null ? meta.owners_count : 'unknown'}, Imported: ${meta.imported ? 'yes' : 'no'}, Accident-free: ${meta.accident_free ? 'yes' : 'no (has been in an accident)'}\n` +
-      `- Location: ${loc.postal_name || loc.municipality || 'unknown'}${loc.county ? ', ' + loc.county : ''}\n` +
-      `- Availability: ${statusLine}\n` +
-      `- Description: ${a.body || '(none)'}\n` +
-      `Answer their questions using these facts. If they ask about damages or condition, use the accident-free flag and owners count as your honest basis. If asked about appointments, confirm we can book a visit at our location and ask for a preferred day and time.`;
+// The detailed fact sheet for a single matched car, used once the model has
+// locked in which vehicle the caller is asking about.
+function buildMatchedCarFacts(car) {
+  const a = ad(car);
+  if (!a) return '';
+  const v = a.vehicle || {};
+  const loc = a.location || {};
+  const meta = a.seller_metadata || {};
+  const statusLine = a.ad_status === 'active'
+    ? 'Available for sale'
+    : (a.ad_status === 'reserved' ? 'Reserved (deposit taken, may still fall through)'
+      : (a.ad_status === 'sold' ? 'Sold' : `Status: ${a.ad_status}`));
+
+  return `- Ad ID: ${a.id}\n` +
+    `- Listing headline: ${a.heading}\n` +
+    `- ${v.year || '?'} ${v.color || ''} ${v.make || ''} ${v.model || ''} ${v.variant || ''}\n`.replace(/ +/g, ' ') +
+    `- Registration: ${v.registration_number || 'unknown'}\n` +
+    `- VIN: ${v.vin || 'unknown'}\n` +
+    `- Price: ${priceText(car) || 'on request'}\n` +
+    `- Mileage: ${v.mileage_km != null ? v.mileage_km + ' km' : 'unknown'}\n` +
+    `- Fuel: ${v.fuel || 'unknown'}\n` +
+    `- Transmission: ${v.transmission || 'unknown'}\n` +
+    `- Drivetrain: ${v.drivetrain || 'unknown'}\n` +
+    `- Body type: ${v.body_type || 'unknown'}, Doors: ${v.doors || '?'}, Seats: ${v.seats || '?'}\n` +
+    `- Power: ${v.engine_power_hp || '?'} hp (${v.engine_power_kw || '?'} kW)\n` +
+    `- Engine size: ${v.engine_size_cc || '?'} cc\n` +
+    `- Fuel consumption: ${v.consumption_l_100km != null ? v.consumption_l_100km + ' L/100km' : 'unknown'}\n` +
+    `- CO₂ emissions: ${v.co2_g_km != null ? v.co2_g_km + ' g/km' : 'unknown'}\n` +
+    `- Emission class: ${v.emission_class || 'unknown'}\n` +
+    `- Inspection valid until: ${v.inspection_valid_until || 'unknown'}\n` +
+    `- Annual tax: ${v.tax_annual_sek != null ? v.tax_annual_sek + ' SEK' : 'unknown'}\n` +
+    `- Towbar: ${v.towbar ? 'yes' : 'no'}\n` +
+    `- Service book: ${v.service_book ? 'yes' : 'no'}\n` +
+    `- Winter tires: ${v.winter_tires ? 'yes' : 'no'}\n` +
+    `- Summer tires: ${v.summer_tires ? 'yes' : 'no'}\n` +
+    `- Previous owners: ${meta.owners_count != null ? meta.owners_count : 'unknown'}\n` +
+    `- Imported: ${meta.imported ? 'yes' : 'no'}\n` +
+    `- Accident-free: ${meta.accident_free ? 'yes' : 'no (has been in an accident)'}\n` +
+    `- Location: ${loc.postal_name || loc.municipality || 'unknown'}${loc.county ? ', ' + loc.county : ''}\n` +
+    `- Availability: ${statusLine}\n` +
+    `- Description: ${a.body || '(none)'}\n`;
+}
+
+function buildReplySystemPrompt(session) {
+  const car = session.matchedCar;
+  const a = ad(car);
+
+  let base =
+    `You are a professional, polite phone assistant for a car dealership. ` +
+    `Speak naturally and briefly — one or two short sentences per reply. ` +
+    `Keep it conversational; do not read out long lists of specs — give the specific facts the caller asked for. ` +
+    `\n\n` +
+    `CRITICAL RULES:\n` +
+    `1. You DO have access to the dealership's full vehicle inventory — it is provided below in this system message. Always use it to answer.\n` +
+    `2. NEVER say you don't have access to the database, don't have the information, can't look it up, or need to check elsewhere. If the caller asks about a vehicle, find it in the inventory and answer directly.\n` +
+    `3. Only ask the caller a clarifying question if the inventory genuinely contains multiple vehicles that match their description, or if they have not mentioned any vehicle at all yet.\n` +
+    `4. When the caller asks a specific factual question (transmission, mileage, price, availability, damages, fuel type, etc.), answer it directly from the inventory data. Do not deflect.\n` +
+    `5. If the caller asks about appointments, confirm we can book a visit at our location and ask for a preferred day and time. If they ask for a callback, acknowledge it and confirm the phone number.\n`;
+
+  if (a) {
+    base += `\n\nThe caller is asking about this specific vehicle (already identified from the conversation):\n` +
+      buildMatchedCarFacts(car) +
+      `\nAnswer the caller's questions using the facts above. When they ask about "damages" or "condition", use the accident-free flag and previous-owners count as the honest basis.`;
   } else {
-    base += `\n\nWe have not yet identified which vehicle the customer is asking about. After your spoken reply, append a sentinel line exactly like this:\n##CAR_CLUES##{"brand":"","model":"","color":"","year":null,"price":null,"registration_number":""}\n` +
-      `Fill in any clues you detected in the whole conversation so far. Use empty string or null when unknown. Never speak the sentinel aloud — it is metadata only.`;
+    base += `\n\nFull vehicle inventory (${cars.length} vehicles). Use this to identify which car the caller is asking about, and to answer their questions. If the caller mentions any identifying detail — registration number, make, model, color, price, year — find the matching car in this list and answer from its row:\n\n` +
+      buildInventorySummary() +
+      `\n\nIf only one vehicle reasonably matches the caller's description, treat it as the one they mean and answer from its row. Only ask "which car" if multiple rows genuinely match.`;
   }
   return base;
 }
 
-async function generateReplyAndExtractCar(session, userText) {
+// Pre-reply car identification: ask a small JSON-only call to pull any car
+// clues out of the full transcript, then match them against the inventory.
+// Runs on every turn until a car is locked in.
+async function identifyCarFromTranscript(session) {
+  if (!openai) return null;
+  if (session.matchedCar) return session.matchedCar;
+  if (!cars.length) return null;
+
+  const transcriptTxt = session.history
+    .filter((h) => h.role === 'user' || h.role === 'assistant')
+    .map((h) => `${h.role === 'user' ? 'Caller' : 'AI'}: ${h.content}`)
+    .join('\n');
+  if (!transcriptTxt.trim()) return null;
+
+  const inventorySummary = buildInventorySummary();
+
+  const sys =
+    `You match a phone caller's spoken request to a specific vehicle in a car dealership's inventory. ` +
+    `Return ONLY valid minified JSON: {"car_id":"<ad_id or empty>","confidence":<0..1>,"brand":"","model":"","color":"","year":null,"price":null,"registration_number":""}. ` +
+    `Put the ad_id of the best-matching row in car_id if you can identify it with reasonable confidence (>=0.5). Otherwise leave car_id empty and fill whatever clues you have. No markdown, no commentary.`;
+
+  const user = `Inventory:\n${inventorySummary}\n\nTranscript so far:\n${transcriptTxt}`;
+
+  try {
+    const t0 = Date.now();
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'system', content: sys }, { role: 'user', content: user }],
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      max_tokens: 150,
+    });
+    log('info', 'inventory', `car identification call ${Date.now() - t0}ms`, { session_id: session.id });
+
+    const obj = JSON.parse(resp.choices[0].message.content || '{}');
+
+    // Preferred: direct ad_id match from the model
+    if (obj.car_id) {
+      const direct = cars.find((c) => carId(c) === String(obj.car_id));
+      if (direct) {
+        log('info', 'inventory', `identified car directly by id=${obj.car_id}`, { session_id: session.id });
+        return direct;
+      }
+    }
+
+    // Fallback: score clues against inventory
+    const clues = {
+      brand: obj.brand || '',
+      model: obj.model || '',
+      color: obj.color || '',
+      year: obj.year || null,
+      price: obj.price || null,
+      registration_number: obj.registration_number || '',
+    };
+    if (Object.values(clues).some((v) => v !== '' && v !== null)) {
+      const { car, score } = matchCarFromClues(clues);
+      if (car) {
+        log('info', 'inventory', `matched car by clues (score=${score}): ${carId(car)}`, { session_id: session.id });
+        return car;
+      }
+    }
+  } catch (e) {
+    log('warn', 'inventory', `car identification failed: ${e.message}`, { session_id: session.id });
+  }
+  return null;
+}
+
+async function generateReply(session, userText) {
   if (!openai) throw new Error('OPENAI_API_KEY not configured');
 
   session.history.push({ role: 'user', content: userText });
@@ -250,30 +369,14 @@ async function generateReplyAndExtractCar(session, userText) {
   const resp = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     messages,
-    temperature: 0.5,
-    max_tokens: 180,
+    temperature: 0.4,
+    max_tokens: 200,
   });
   log('info', 'openai', `reply generated in ${Date.now() - t0}ms`, { session_id: session.id });
 
-  let text = (resp.choices[0]?.message?.content || '').trim();
-
-  // Strip sentinel
-  let clues = null;
-  const sentIdx = text.indexOf('##CAR_CLUES##');
-  if (sentIdx !== -1) {
-    const before = text.slice(0, sentIdx).trim();
-    const after  = text.slice(sentIdx + '##CAR_CLUES##'.length).trim();
-    try {
-      const jsonMatch = after.match(/\{[\s\S]*?\}/);
-      if (jsonMatch) clues = JSON.parse(jsonMatch[0]);
-    } catch (e) {
-      log('warn', 'extraction', `failed to parse car clues: ${e.message}`, { session_id: session.id });
-    }
-    text = before;
-  }
-
+  const text = (resp.choices[0]?.message?.content || '').trim();
   session.history.push({ role: 'assistant', content: text });
-  return { text, clues };
+  return text;
 }
 
 async function extractLead(session) {
@@ -416,20 +519,26 @@ async function processCallerInput(session, userText) {
   persistCall(session);
 
   try {
-    const { text: reply, clues } = await generateReplyAndExtractCar(session, userText);
+    // Step 1: push the new caller utterance onto history so the identifier call sees it.
+    session.history.push({ role: 'user', content: userText });
 
-    // Attempt car match if not yet matched
-    if (!session.matchedCar && clues) {
-      const { car, score, candidates } = matchCarFromClues(clues);
-      if (car) {
-        session.matchedCar = car;
-        log('info', 'inventory', `matched car ${carId(car)} (score=${score})`, { session_id: session.id });
-      } else if (candidates.length > 0) {
-        log('info', 'inventory', `no strong match; ${candidates.length} candidates`, { session_id: session.id });
-      } else {
-        log('info', 'inventory', `no matching car yet`, { session_id: session.id });
+    // Step 2: if we haven't locked a car in yet, try to identify one from the
+    // full transcript against the inventory. This runs every turn until matched.
+    if (!session.matchedCar) {
+      const identified = await identifyCarFromTranscript(session);
+      if (identified) {
+        session.matchedCar = identified;
+        broadcast({ type: 'session', session: serializeSession(session) });
       }
     }
+
+    // Step 3: generate the reply with full inventory context (either the
+    // matched car's fact sheet, or the full inventory summary if still
+    // unmatched). generateReply pushes the assistant reply onto history.
+    // NOTE: we already pushed the user turn above, so we pop it here because
+    // generateReply pushes it again. Keeps history clean.
+    session.history.pop();
+    const reply = await generateReply(session, userText);
 
     const ts = new Date().toISOString();
     session.transcript.push({ speaker: 'ai', text: reply, ts });
