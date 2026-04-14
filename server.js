@@ -27,7 +27,7 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 // ---------------------------------------------------------------------------
 // In-memory state
 // ---------------------------------------------------------------------------
-let cars  = loadJSONSafe(CARS_FILE,  []);
+let cars  = loadCarsFile(CARS_FILE);
 let calls = loadJSONSafe(CALLS_FILE, []);
 let leads = loadJSONSafe(LEADS_FILE, []);
 const sessions = new Map();        // call_id -> session
@@ -38,6 +38,25 @@ const MAX_LOGS = 2000;
 function loadJSONSafe(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch { return fallback; }
+}
+
+// cars.json may be stored as concatenated JSON objects separated by blank
+// lines rather than a proper JSON array. This loader handles both formats.
+function loadCarsFile(file) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    // Fast path: valid JSON array (or single object).
+    try { return JSON.parse(raw); } catch {}
+    // Fallback: split on blank lines between top-level objects and parse each.
+    const parts = raw.split(/(?<=\})\s*\n\s*(?=\{)/);
+    const result = [];
+    for (const p of parts) {
+      const t = p.trim();
+      if (!t) continue;
+      try { result.push(JSON.parse(t)); } catch {}
+    }
+    return result;
+  } catch { return []; }
 }
 
 // ---------------------------------------------------------------------------
