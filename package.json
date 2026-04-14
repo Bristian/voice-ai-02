@@ -1,0 +1,19 @@
+{
+  "name": "voice-ai-car-dealer",
+  "version": "1.0.0",
+  "description": "AI Car Dealer Phone Assistant with Vonage, ElevenLabs, and OpenAI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0",
+    "dotenv": "^16.4.5",
+    "openai": "^4.52.0",
+    "@elevenlabs/elevenlabs-js": "^2.0.0"
+  }
+}

@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Car Dealer AI Assistant — Dashboard</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">AI</div>
+    <div>
+      <div class="brand-title">Dealer Assistant</div>
+      <div class="brand-sub">Voice AI Dashboard</div>
+    </div>
+  </div>
+  <nav>
+    <button class="nav-item active" data-view="leads">
+      <span class="nav-icon">📥</span>Leads Inbox
+      <span class="badge" id="badge-leads">0</span>
+    </button>
+    <button class="nav-item" data-view="inventory">
+      <span class="nav-icon">🚗</span>Inventory
+      <span class="badge" id="badge-inventory">0</span>
+    </button>
+    <button class="nav-item" data-view="live">
+      <span class="nav-icon">📞</span>Live Calls
+      <span class="badge live" id="badge-live">0</span>
+    </button>
+    <button class="nav-item" data-view="logs">
+      <span class="nav-icon">📜</span>Logs
+    </button>
+  </nav>
+  <div class="sidebar-footer">
+    <div class="status-dot" id="sse-dot"></div>
+    <span id="sse-status">Connecting…</span>
+  </div>
+</aside>
+
+<main>
+  <!-- LEADS -->
+  <section class="view active" id="view-leads">
+    <header class="view-header">
+      <h1>Leads Inbox</h1>
+      <div class="view-sub">Enquiries captured by the AI assistant</div>
+    </header>
+    <div class="split">
+      <div class="list-pane" id="leads-list"></div>
+      <div class="detail-pane" id="lead-detail">
+        <div class="empty">Select a lead to view details</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- INVENTORY -->
+  <section class="view" id="view-inventory">
+    <header class="view-header">
+      <h1>Inventory</h1>
+      <div class="view-sub">50 vehicles on the lot</div>
+    </header>
+    <div class="filter-bar">
+      <input id="inv-search" placeholder="Search brand, model, reg number…" />
+      <select id="inv-available">
+        <option value="">All</option>
+        <option value="true">Available</option>
+        <option value="false">Sold</option>
+      </select>
+    </div>
+    <div class="split">
+      <div class="list-pane" id="inv-list"></div>
+      <div class="detail-pane" id="car-detail">
+        <div class="empty">Select a car to view details</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- LIVE -->
+  <section class="view" id="view-live">
+    <header class="view-header">
+      <h1>Live Calls</h1>
+      <div class="view-sub">Active conversations happening right now</div>
+    </header>
+    <div id="live-container"></div>
+  </section>
+
+  <!-- LOGS -->
+  <section class="view" id="view-logs">
+    <header class="view-header">
+      <h1>Logs</h1>
+      <div class="view-sub">Verbose real-time troubleshooting output</div>
+    </header>
+    <div class="filter-bar">
+      <select id="log-level">
+        <option value="">All levels</option>
+        <option value="info">Info</option>
+        <option value="warn">Warn</option>
+        <option value="error">Error</option>
+      </select>
+      <select id="log-source">
+        <option value="">All sources</option>
+        <option>webhook</option>
+        <option>websocket</option>
+        <option>elevenlabs</option>
+        <option>openai</option>
+        <option>tts</option>
+        <option>extraction</option>
+        <option>inventory</option>
+        <option>errors</option>
+        <option>storage</option>
+      </select>
+      <button id="copy-logs">Copy visible</button>
+      <button id="clear-logs">Clear view</button>
+    </div>
+    <pre id="logs-output" class="logs-box"></pre>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
