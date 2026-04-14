@@ -120,23 +120,66 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ---------------------------------------------------------------------------
 // Inventory helpers
+//
+// The inventory JSON follows the Blocket vehicle_ad schema. Each entry is
+// shaped like { "vehicle_ad": { ... } }. These helpers unwrap it and expose
+// the fields the rest of the app needs.
 // ---------------------------------------------------------------------------
+function ad(car) {
+  return (car && car.vehicle_ad) ? car.vehicle_ad : null;
+}
+function carId(car) {
+  const a = ad(car);
+  return a ? String(a.id) : null;
+}
+function isAvailable(car) {
+  const a = ad(car);
+  return !!(a && a.ad_status === 'active');
+}
+function carLabel(car) {
+  const a = ad(car);
+  if (!a) return 'Unknown vehicle';
+  const v = a.vehicle || {};
+  const parts = [v.year, v.color, v.make, v.model, v.variant].filter(Boolean);
+  return parts.join(' ') || a.heading || 'Unknown vehicle';
+}
+function carShortLabel(car) {
+  const a = ad(car);
+  if (!a) return 'Unknown vehicle';
+  const v = a.vehicle || {};
+  return [v.year, v.make, v.model].filter(Boolean).join(' ') || a.heading;
+}
+function priceText(car) {
+  const a = ad(car);
+  if (!a || !a.price) return '';
+  const { amount, currency, suffix } = a.price;
+  if (suffix) return `${amount} ${suffix}`;
+  if (currency) return `${amount} ${currency}`;
+  return String(amount);
+}
 function normalize(s) {
   return (s || '').toString().toLowerCase().replace(/[\s\-_]/g, '');
 }
 function scoreCar(car, clues) {
+  const a = ad(car);
+  if (!a) return 0;
+  const v = a.vehicle || {};
+  const p = a.price || {};
   let score = 0;
   const c = clues || {};
-  if (c.registration_number && normalize(car.registration_number) === normalize(c.registration_number)) score += 100;
-  if (c.brand && normalize(car.brand).includes(normalize(c.brand))) score += 8;
-  if (c.model && normalize(car.model).includes(normalize(c.model))) score += 8;
-  if (c.color && normalize(car.color) === normalize(c.color)) score += 4;
-  if (c.year && Number(c.year) === Number(car.year)) score += 3;
-  if (c.price) {
-    const diff = Math.abs(Number(c.price) - Number(car.price));
-    if (diff < 500)  score += 6;
-    else if (diff < 2000) score += 3;
-    else if (diff < 5000) score += 1;
+  if (c.registration_number && v.registration_number &&
+      normalize(v.registration_number) === normalize(c.registration_number)) score += 100;
+  if (c.brand && v.make && normalize(v.make).includes(normalize(c.brand))) score += 8;
+  if (c.model && v.model && normalize(v.model).includes(normalize(c.model))) score += 8;
+  if (c.model && v.variant && normalize(v.variant).includes(normalize(c.model))) score += 2;
+  if (c.color && v.color && normalize(v.color) === normalize(c.color)) score += 4;
+  if (c.year && v.year && Number(c.year) === Number(v.year)) score += 3;
+  if (c.price && p.amount) {
+    const diff = Math.abs(Number(c.price) - Number(p.amount));
+    // Threshold scales with price magnitude since prices may be in SEK (6-digit) or USD (5-digit)
+    if (diff < 1000)  score += 6;
+    else if (diff < 5000) score += 3;
+    else if (diff < 20000) score += 1;
   }
   return score;
 }
@@ -157,19 +200,35 @@ function buildReplySystemPrompt(session) {
   const car = session.matchedCar;
   let base = `You are a professional, polite assistant for a car dealership. Speak naturally and briefly — one or two short sentences per reply. Help the customer, gather their intent, ask clarifying questions when needed, and be useful. Do not list prices or specifications unless asked.`;
 
-  if (car) {
+  const a = ad(car);
+  if (a) {
+    const v = a.vehicle || {};
+    const loc = a.location || {};
+    const meta = a.seller_metadata || {};
+    const statusLine = a.ad_status === 'active'
+      ? 'Available for sale'
+      : (a.ad_status === 'reserved' ? 'Reserved (deposit taken, may still fall through)'
+        : (a.ad_status === 'sold' ? 'Sold' : `Status: ${a.ad_status}`));
+
     base += `\n\nThe customer is asking about this vehicle from our inventory:\n` +
-      `- ${car.year} ${car.color} ${car.brand} ${car.model}\n` +
-      `- Registration: ${car.registration_number}\n` +
-      `- Price: $${car.price}\n` +
-      `- Mileage: ${car.mileage} km\n` +
-      `- Fuel: ${car.fuel_type}, Transmission: ${car.transmission}\n` +
-      `- Horsepower: ${car.horsepower}\n` +
-      `- Condition: ${car.condition}\n` +
-      `- Damages: ${car.damages || 'None reported'}\n` +
-      `- Available: ${car.available ? 'Yes' : 'No (sold)'}\n` +
-      `- Description: ${car.description}\n` +
-      `Answer their questions using these facts. If asked about appointments, confirm we can book a visit and ask for a preferred day and time.`;
+      `- Listing: ${a.heading}\n` +
+      `- ${v.year || '?'} ${v.color || ''} ${v.make || ''} ${v.model || ''} ${v.variant || ''}\n`.replace(/ +/g, ' ') +
+      `- Registration: ${v.registration_number || 'unknown'}\n` +
+      `- Price: ${priceText(car) || 'on request'}\n` +
+      `- Mileage: ${v.mileage_km != null ? v.mileage_km + ' km' : 'unknown'}\n` +
+      `- Fuel: ${v.fuel || 'unknown'}, Transmission: ${v.transmission || 'unknown'}, Drivetrain: ${v.drivetrain || 'unknown'}\n` +
+      `- Body type: ${v.body_type || 'unknown'}, Doors: ${v.doors || '?'}, Seats: ${v.seats || '?'}\n` +
+      `- Power: ${v.engine_power_hp || '?'} hp (${v.engine_power_kw || '?'} kW), Engine: ${v.engine_size_cc || '?'} cc\n` +
+      `- Fuel consumption: ${v.consumption_l_100km != null ? v.consumption_l_100km + ' L/100km' : 'unknown'}, CO₂: ${v.co2_g_km != null ? v.co2_g_km + ' g/km' : 'unknown'}\n` +
+      `- Emission class: ${v.emission_class || 'unknown'}\n` +
+      `- Inspection valid until: ${v.inspection_valid_until || 'unknown'}\n` +
+      `- Annual tax: ${v.tax_annual_sek != null ? v.tax_annual_sek + ' SEK' : 'unknown'}\n` +
+      `- Towbar: ${v.towbar ? 'yes' : 'no'}, Service book: ${v.service_book ? 'yes' : 'no'}, Winter tires: ${v.winter_tires ? 'yes' : 'no'}, Summer tires: ${v.summer_tires ? 'yes' : 'no'}\n` +
+      `- Previous owners: ${meta.owners_count != null ? meta.owners_count : 'unknown'}, Imported: ${meta.imported ? 'yes' : 'no'}, Accident-free: ${meta.accident_free ? 'yes' : 'no (has been in an accident)'}\n` +
+      `- Location: ${loc.postal_name || loc.municipality || 'unknown'}${loc.county ? ', ' + loc.county : ''}\n` +
+      `- Availability: ${statusLine}\n` +
+      `- Description: ${a.body || '(none)'}\n` +
+      `Answer their questions using these facts. If they ask about damages or condition, use the accident-free flag and owners count as your honest basis. If asked about appointments, confirm we can book a visit at our location and ask for a preferred day and time.`;
   } else {
     base += `\n\nWe have not yet identified which vehicle the customer is asking about. After your spoken reply, append a sentinel line exactly like this:\n##CAR_CLUES##{"brand":"","model":"","color":"","year":null,"price":null,"registration_number":""}\n` +
       `Fill in any clues you detected in the whole conversation so far. Use empty string or null when unknown. Never speak the sentinel aloud — it is metadata only.`;
@@ -246,9 +305,10 @@ async function extractLead(session) {
     `- questions: array of short strings listing what the caller asked.\n` +
     `- notes: any extra context worth knowing for the salesperson.`;
 
+  const mA = ad(session.matchedCar);
   const user = `Transcript:\n${transcriptTxt}\n\n` +
-    (session.matchedCar
-      ? `Matched car: ${session.matchedCar.id} — ${session.matchedCar.year} ${session.matchedCar.color} ${session.matchedCar.brand} ${session.matchedCar.model} (${session.matchedCar.registration_number})`
+    (mA
+      ? `Matched car: ${mA.id} — ${carLabel(session.matchedCar)} (${mA.vehicle?.registration_number || 'no reg'})`
       : `Matched car: none`);
 
   try {
@@ -262,9 +322,9 @@ async function extractLead(session) {
     });
     log('info', 'extraction', `lead extracted in ${Date.now() - t0}ms`, { session_id: session.id });
     const obj = JSON.parse(resp.choices[0].message.content);
-    if (session.matchedCar) {
-      obj.requested_car_id = session.matchedCar.id;
-      obj.requested_car_label = `${session.matchedCar.year} ${session.matchedCar.color} ${session.matchedCar.brand} ${session.matchedCar.model}`;
+    if (mA) {
+      obj.requested_car_id = String(mA.id);
+      obj.requested_car_label = carLabel(session.matchedCar);
     }
     return obj;
   } catch (e) {
@@ -335,10 +395,8 @@ function serializeSession(s) {
     status: s.status,
     turn: s.turn,
     started_at: s.started_at,
-    matched_car_id: s.matchedCar ? s.matchedCar.id : null,
-    matched_car_label: s.matchedCar
-      ? `${s.matchedCar.year} ${s.matchedCar.color} ${s.matchedCar.brand} ${s.matchedCar.model}`
-      : null,
+    matched_car_id: carId(s.matchedCar),
+    matched_car_label: s.matchedCar ? carLabel(s.matchedCar) : null,
     transcript: s.transcript,
     interim: s.interim || '',
   };
@@ -365,7 +423,7 @@ async function processCallerInput(session, userText) {
       const { car, score, candidates } = matchCarFromClues(clues);
       if (car) {
         session.matchedCar = car;
-        log('info', 'inventory', `matched car ${car.id} (score=${score})`, { session_id: session.id });
+        log('info', 'inventory', `matched car ${carId(car)} (score=${score})`, { session_id: session.id });
       } else if (candidates.length > 0) {
         log('info', 'inventory', `no strong match; ${candidates.length} candidates`, { session_id: session.id });
       } else {
@@ -396,7 +454,7 @@ function persistCall(session) {
     status: session.status,
     started_at: session.started_at,
     ended_at: session.ended_at || null,
-    matched_car_id: session.matchedCar ? session.matchedCar.id : null,
+    matched_car_id: carId(session.matchedCar),
     transcript: session.transcript,
   };
   if (existing) Object.assign(existing, record);
@@ -628,10 +686,11 @@ app.all('/api/vonage/events', (req, res) => {
 // Dashboard APIs
 app.get('/api/cars', (_req, res) => res.json(cars));
 app.get('/api/cars/:id', (req, res) => {
-  const car = cars.find((c) => c.id === req.params.id);
+  const car = cars.find((c) => carId(c) === req.params.id);
   if (!car) return res.status(404).json({ error: 'not_found' });
-  const carLeads = leads.filter((l) => l.requested_car_id === car.id);
-  const carCalls = calls.filter((c) => c.matched_car_id === car.id);
+  const cid = carId(car);
+  const carLeads = leads.filter((l) => l.requested_car_id === cid);
+  const carCalls = calls.filter((c) => c.matched_car_id === cid);
   res.json({ car, leads: carLeads, calls: carCalls });
 });
 
@@ -640,7 +699,7 @@ app.get('/api/leads/:id', (req, res) => {
   const lead = leads.find((l) => l.id === req.params.id);
   if (!lead) return res.status(404).json({ error: 'not_found' });
   const call = calls.find((c) => c.id === lead.call_id) || null;
-  const car = lead.requested_car_id ? cars.find((c) => c.id === lead.requested_car_id) : null;
+  const car = lead.requested_car_id ? cars.find((c) => carId(c) === lead.requested_car_id) : null;
   res.json({ lead, call, car });
 });
 app.post('/api/leads/:id/read', (req, res) => {
