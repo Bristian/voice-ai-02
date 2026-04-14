@@ -16,6 +16,48 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])));
 const fmtTime = (iso) => { if (!iso) return ''; const d = new Date(iso); return d.toLocaleString(); };
 const fmtShort = (iso) => { if (!iso) return ''; const d = new Date(iso); return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + ' · ' + d.toLocaleDateString(); };
+const fmtNum = (n) => (n == null || n === '' || isNaN(Number(n))) ? '—' : Number(n).toLocaleString();
+const yesNo = (v) => v === true ? 'Yes' : v === false ? 'No' : '—';
+
+// ---- car schema helpers (Blocket vehicle_ad) ----
+const ad = (c) => (c && c.vehicle_ad) ? c.vehicle_ad : null;
+const carId = (c) => { const a = ad(c); return a ? String(a.id) : ''; };
+const carHeading = (c) => { const a = ad(c); return a ? (a.heading || '') : ''; };
+const carVehicle = (c) => { const a = ad(c); return (a && a.vehicle) ? a.vehicle : {}; };
+const carPriceText = (c) => {
+  const a = ad(c); if (!a || !a.price) return '—';
+  const { amount, currency, suffix } = a.price;
+  if (suffix) return `${fmtNum(amount)} ${suffix}`;
+  if (currency) return `${fmtNum(amount)} ${currency}`;
+  return fmtNum(amount);
+};
+const carPrimaryImage = (c) => {
+  const a = ad(c); if (!a || !a.media || !a.media.images || !a.media.images.length) return '';
+  const primary = a.media.images.find(i => i.is_primary) || a.media.images[0];
+  return primary.url || '';
+};
+const carLabel = (c) => {
+  const v = carVehicle(c);
+  return [v.year, v.color, v.make, v.model, v.variant].filter(Boolean).join(' ') || carHeading(c) || 'Unknown vehicle';
+};
+const carShortLabel = (c) => {
+  const v = carVehicle(c);
+  return [v.year, v.make, v.model].filter(Boolean).join(' ') || carHeading(c) || 'Unknown vehicle';
+};
+const carLocationText = (c) => {
+  const a = ad(c); if (!a || !a.location) return '—';
+  const l = a.location;
+  return [l.postal_name || l.municipality, l.county].filter(Boolean).join(', ') || '—';
+};
+const statusChip = (c) => {
+  const a = ad(c); if (!a) return '';
+  switch (a.ad_status) {
+    case 'active':   return '<span class="chip green">Available</span>';
+    case 'reserved': return '<span class="chip amber">Reserved</span>';
+    case 'sold':     return '<span class="chip red">Sold</span>';
+    default:         return `<span class="chip">${esc(a.ad_status || 'unknown')}</span>`;
+  }
+};
 
 // ---- navigation ----
 document.querySelectorAll('.nav-item').forEach((el) => {
@@ -110,18 +152,24 @@ async function openLead(id) {
 
     <div class="detail-section">
       <h3>Matched Car</h3>
-      ${car ? `
+      ${car ? (() => {
+        const v = carVehicle(car);
+        return `
         <dl class="kv-grid">
-          <dt>Brand</dt><dd>${esc(car.brand)}</dd>
-          <dt>Model</dt><dd>${esc(car.model)}</dd>
-          <dt>Year</dt><dd>${esc(car.year)}</dd>
-          <dt>Color</dt><dd>${esc(car.color)}</dd>
-          <dt>Price</dt><dd>$${esc(car.price)}</dd>
-          <dt>Registration</dt><dd>${esc(car.registration_number)}</dd>
-          <dt>Mileage</dt><dd>${esc(car.mileage)} km</dd>
-          <dt>Available</dt><dd>${car.available ? '<span class="chip green">Available</span>' : '<span class="chip red">Sold</span>'}</dd>
+          <dt>Listing</dt><dd>${esc(carHeading(car) || '—')}</dd>
+          <dt>Make</dt><dd>${esc(v.make || '—')}</dd>
+          <dt>Model</dt><dd>${esc(v.model || '—')}</dd>
+          <dt>Variant</dt><dd>${esc(v.variant || '—')}</dd>
+          <dt>Year</dt><dd>${esc(v.year || '—')}</dd>
+          <dt>Color</dt><dd>${esc(v.color || '—')}</dd>
+          <dt>Price</dt><dd>${esc(carPriceText(car))}</dd>
+          <dt>Registration</dt><dd>${esc(v.registration_number || '—')}</dd>
+          <dt>Mileage</dt><dd>${v.mileage_km != null ? fmtNum(v.mileage_km) + ' km' : '—'}</dd>
+          <dt>Fuel</dt><dd>${esc(v.fuel || '—')}</dd>
+          <dt>Location</dt><dd>${esc(carLocationText(car))}</dd>
+          <dt>Status</dt><dd>${statusChip(car)}</dd>
         </dl>
-      ` : '<div class="empty">No car matched for this enquiry</div>'}
+      `; })() : '<div class="empty">No car matched for this enquiry</div>'}
     </div>
 
     <div class="detail-section">
@@ -159,13 +207,17 @@ async function openLead(id) {
 
 // ---- inventory ----
 function renderInventory() {
-  const q = state.invFilter.q.toLowerCase();
+  const q = state.invFilter.q.toLowerCase().trim();
   const avail = state.invFilter.available;
   let filtered = state.cars;
-  if (q) filtered = filtered.filter(c =>
-    (c.brand + ' ' + c.model + ' ' + c.registration_number + ' ' + c.color).toLowerCase().includes(q)
-  );
-  if (avail !== '') filtered = filtered.filter(c => String(c.available) === avail);
+  if (q) filtered = filtered.filter(c => {
+    const v = carVehicle(c);
+    const hay = [v.make, v.model, v.variant, v.registration_number, v.color, v.vin, carHeading(c)]
+      .filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+  if (avail === 'true')  filtered = filtered.filter(c => ad(c) && ad(c).ad_status === 'active');
+  if (avail === 'false') filtered = filtered.filter(c => ad(c) && ad(c).ad_status !== 'active');
 
   const list = $('#inv-list');
   if (filtered.length === 0) {
@@ -173,15 +225,21 @@ function renderInventory() {
     return;
   }
   list.innerHTML = filtered.map(c => {
-    const selected = c.id === state.selectedCarId ? 'selected' : '';
-    const avChip = c.available ? '<span class="chip green">Available</span>' : '<span class="chip red">Sold</span>';
+    const id = carId(c);
+    const v = carVehicle(c);
+    const selected = id === state.selectedCarId ? 'selected' : '';
+    const img = carPrimaryImage(c);
     return `
-      <div class="list-item inv ${selected}" data-car-id="${c.id}">
-        <div class="inv-thumb" style="background-image:url('${esc(c.images?.[0] || '')}')"></div>
+      <div class="list-item inv ${selected}" data-car-id="${esc(id)}">
+        <div class="inv-thumb" style="background-image:url('${esc(img)}')"></div>
         <div class="inv-body">
-          <div class="list-item-title">${esc(c.year)} ${esc(c.brand)} ${esc(c.model)}</div>
-          <div class="list-item-sub">${esc(c.color)} · ${esc(c.registration_number)} · $${esc(c.price)}</div>
-          <div class="pill-row">${avChip}<span class="chip">${esc(c.fuel_type)}</span></div>
+          <div class="list-item-title">${esc(carShortLabel(c))}</div>
+          <div class="list-item-sub">${esc(v.color || '')} · ${esc(v.registration_number || '')} · ${esc(carPriceText(c))}</div>
+          <div class="pill-row">
+            ${statusChip(c)}
+            ${v.fuel ? `<span class="chip">${esc(v.fuel)}</span>` : ''}
+            ${v.transmission ? `<span class="chip">${esc(v.transmission)}</span>` : ''}
+          </div>
         </div>
       </div>`;
   }).join('');
@@ -193,9 +251,17 @@ function renderInventory() {
 async function openCar(id) {
   state.selectedCarId = id;
   renderInventory();
-  const data = await fetch(`/api/cars/${id}`).then(r => r.json());
-  const { car, leads: cLeads, calls: cCalls } = data;
+  const data = await fetch(`/api/cars/${encodeURIComponent(id)}`).then(r => r.json());
+  const { car, leads: cLeads } = data;
   const pane = $('#car-detail');
+
+  const a = ad(car) || {};
+  const v = a.vehicle || {};
+  const loc = a.location || {};
+  const meta = a.seller_metadata || {};
+  const adv = a.advertiser || {};
+  const store = a.store || {};
+  const img = carPrimaryImage(car);
 
   const leadsHtml = cLeads.length ? cLeads.map(l => `
     <div class="list-item" data-lead-id="${l.id}" style="border-radius:8px; margin-bottom:6px; border:1px solid var(--border);">
@@ -205,26 +271,104 @@ async function openCar(id) {
     </div>`).join('') : '<div class="empty">No enquiries yet</div>';
 
   pane.innerHTML = `
-    <div class="detail-title">${esc(car.year)} ${esc(car.brand)} ${esc(car.model)}</div>
-    <div class="detail-sub">${esc(car.color)} · ${esc(car.registration_number)}</div>
+    <div class="detail-title">${esc(a.heading || carLabel(car))}</div>
+    <div class="detail-sub">${esc(v.registration_number || '')} · ${esc(carLocationText(car))} · ${statusChip(car)}</div>
+
+    ${img ? `<div style="margin:16px 0;"><img src="${esc(img)}" alt="" style="width:100%; max-height:280px; object-fit:cover; border-radius:8px; background:var(--bg-elevated-2);" onerror="this.style.display='none'"></div>` : ''}
 
     <div class="detail-section">
-      <h3>Specifications</h3>
+      <h3>Price</h3>
+      <div style="font-size:22px; font-weight:700;">${esc(carPriceText(car))}</div>
+      ${a.price && a.price.price_type ? `<div class="list-item-sub">${esc(a.price.price_type)}</div>` : ''}
+    </div>
+
+    <div class="detail-section">
+      <h3>Vehicle</h3>
       <dl class="kv-grid">
-        <dt>Price</dt><dd>$${esc(car.price)}</dd>
-        <dt>Mileage</dt><dd>${esc(car.mileage)} km</dd>
-        <dt>Fuel</dt><dd>${esc(car.fuel_type)}</dd>
-        <dt>Transmission</dt><dd>${esc(car.transmission)}</dd>
-        <dt>Horsepower</dt><dd>${esc(car.horsepower)} hp</dd>
-        <dt>Condition</dt><dd>${esc(car.condition)}</dd>
-        <dt>Damages</dt><dd>${esc(car.damages || 'None')}</dd>
-        <dt>Status</dt><dd>${car.available ? '<span class="chip green">Available</span>' : '<span class="chip red">Sold</span>'}</dd>
+        <dt>Make</dt><dd>${esc(v.make || '—')}</dd>
+        <dt>Model</dt><dd>${esc(v.model || '—')}</dd>
+        <dt>Variant</dt><dd>${esc(v.variant || '—')}</dd>
+        <dt>Year</dt><dd>${esc(v.year || '—')}</dd>
+        <dt>Color</dt><dd>${esc(v.color || '—')}</dd>
+        <dt>Body type</dt><dd>${esc(v.body_type || '—')}</dd>
+        <dt>Doors / Seats</dt><dd>${esc(v.doors || '—')} / ${esc(v.seats || '—')}</dd>
+        <dt>Registration</dt><dd>${esc(v.registration_number || '—')}</dd>
+        <dt>VIN</dt><dd style="font-family:monospace; font-size:12px;">${esc(v.vin || '—')}</dd>
       </dl>
     </div>
 
     <div class="detail-section">
+      <h3>Powertrain</h3>
+      <dl class="kv-grid">
+        <dt>Fuel</dt><dd>${esc(v.fuel || '—')}</dd>
+        <dt>Transmission</dt><dd>${esc(v.transmission || '—')}</dd>
+        <dt>Drivetrain</dt><dd>${esc(v.drivetrain || '—')}</dd>
+        <dt>Power</dt><dd>${v.engine_power_hp != null ? esc(v.engine_power_hp) + ' hp' : '—'} ${v.engine_power_kw != null ? '(' + esc(v.engine_power_kw) + ' kW)' : ''}</dd>
+        <dt>Engine size</dt><dd>${v.engine_size_cc != null ? fmtNum(v.engine_size_cc) + ' cc' : '—'}</dd>
+        <dt>Mileage</dt><dd>${v.mileage_km != null ? fmtNum(v.mileage_km) + ' km' : '—'}</dd>
+        <dt>Consumption</dt><dd>${v.consumption_l_100km != null ? esc(v.consumption_l_100km) + ' L/100km' : '—'}</dd>
+        <dt>CO₂</dt><dd>${v.co2_g_km != null ? esc(v.co2_g_km) + ' g/km' : '—'}</dd>
+        <dt>Emission class</dt><dd>${esc(v.emission_class || '—')}</dd>
+      </dl>
+    </div>
+
+    <div class="detail-section">
+      <h3>Ownership & condition</h3>
+      <dl class="kv-grid">
+        <dt>Previous owners</dt><dd>${meta.owners_count != null ? esc(meta.owners_count) : '—'}</dd>
+        <dt>Imported</dt><dd>${yesNo(meta.imported)}</dd>
+        <dt>Accident-free</dt><dd>${yesNo(meta.accident_free)}</dd>
+        <dt>Service book</dt><dd>${yesNo(v.service_book)}</dd>
+        <dt>Inspection valid until</dt><dd>${esc(v.inspection_valid_until || '—')}</dd>
+        <dt>Annual tax</dt><dd>${v.tax_annual_sek != null ? fmtNum(v.tax_annual_sek) + ' SEK' : '—'}</dd>
+      </dl>
+    </div>
+
+    <div class="detail-section">
+      <h3>Equipment</h3>
+      <div class="pill-row">
+        ${v.towbar ? '<span class="chip blue">Towbar</span>' : ''}
+        ${v.winter_tires ? '<span class="chip blue">Winter tires</span>' : ''}
+        ${v.summer_tires ? '<span class="chip blue">Summer tires</span>' : ''}
+        ${v.service_book ? '<span class="chip blue">Service book</span>' : ''}
+      </div>
+    </div>
+
+    <div class="detail-section">
+      <h3>Location</h3>
+      <dl class="kv-grid">
+        <dt>Postal area</dt><dd>${esc(loc.postal_code || '—')} ${esc(loc.postal_name || '')}</dd>
+        <dt>Municipality</dt><dd>${esc(loc.municipality || '—')}</dd>
+        <dt>County</dt><dd>${esc(loc.county || '—')}</dd>
+      </dl>
+    </div>
+
+    <div class="detail-section">
+      <h3>Seller</h3>
+      <dl class="kv-grid">
+        <dt>Name</dt><dd>${esc(adv.name || store.store_name || '—')} ${adv.is_verified ? '<span class="chip green">Verified</span>' : ''}</dd>
+        <dt>Type</dt><dd>${esc(adv.type || '—')}</dd>
+        <dt>Phone</dt><dd>${esc(adv.phone || '—')}</dd>
+        <dt>Email</dt><dd>${esc(adv.email || '—')}</dd>
+        ${store.store_url ? `<dt>Store</dt><dd><a href="${esc(store.store_url)}" target="_blank" rel="noopener" style="color:var(--accent)">${esc(store.store_name || store.store_url)}</a></dd>` : ''}
+      </dl>
+    </div>
+
+    ${a.body ? `
+    <div class="detail-section">
       <h3>Description</h3>
-      <div>${esc(car.description)}</div>
+      <div>${esc(a.body)}</div>
+    </div>` : ''}
+
+    <div class="detail-section">
+      <h3>Listing</h3>
+      <dl class="kv-grid">
+        <dt>Ad ID</dt><dd style="font-family:monospace;">${esc(a.id || '—')}</dd>
+        <dt>Status</dt><dd>${statusChip(car)}</dd>
+        <dt>Published</dt><dd>${fmtShort(a.published_at) || '—'}</dd>
+        <dt>Updated</dt><dd>${fmtShort(a.updated_at) || '—'}</dd>
+        ${a.canonical_url ? `<dt>Link</dt><dd><a href="${esc(a.canonical_url)}" target="_blank" rel="noopener" style="color:var(--accent)">View original listing</a></dd>` : ''}
+      </dl>
     </div>
 
     <div class="detail-section">
