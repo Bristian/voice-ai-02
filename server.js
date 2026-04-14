@@ -463,8 +463,9 @@ async function speakToCaller(session, text) {
     const CHUNK = 640; // 20ms at 16kHz 16-bit mono
     session.playbackAborted = false;
 
+    let bargedIn = false;
     for (let i = 0; i < pcm16.length; i += CHUNK) {
-      if (session.playbackAborted) break;
+      if (session.playbackAborted) { bargedIn = true; break; }
       if (!session.ws || session.ws.readyState !== WebSocket.OPEN) break;
       let chunk = pcm16.subarray(i, i + CHUNK);
       if (chunk.length < CHUNK) {
@@ -476,13 +477,11 @@ async function speakToCaller(session, text) {
       catch (e) { log('warn', 'websocket', `send failed: ${e.message}`, { session_id: session.id }); break; }
       await sleep(20);
     }
-    log('info', 'tts', `playback complete`, { session_id: session.id });
+    log('info', 'tts', bargedIn ? `playback aborted (barge-in)` : `playback complete`, { session_id: session.id });
   } catch (e) {
     log('error', 'tts', `tts failed: ${e.message}`, { session_id: session.id });
-  } finally {
-    session.turn = 'idle';
-    broadcast({ type: 'session', session: serializeSession(session) });
   }
+  // NOTE: turn state is reset by runTurn's finally block, not here.
 }
 
 // ---------------------------------------------------------------------------
@@ -506,8 +505,150 @@ function serializeSession(s) {
 }
 
 async function processCallerInput(session, userText) {
+  // Legacy entry point kept for safety; all utterance handling goes through
+  // handleCommittedUtterance now which buffers and checks completeness.
+  return handleCommittedUtterance(session, userText);
+}
+
+// Completeness heuristic: is this utterance likely the end of the caller's
+// turn, or are they mid-sentence and about to continue? Used purely as a
+// fast local pre-filter so we don't call OpenAI for every fragment.
+function looksComplete(text) {
+  if (!text) return false;
+  const t = text.trim();
+  if (t.length < 3) return false;
+  // Ends with terminal punctuation → definitely complete.
+  if (/[.!?]["')\]]?$/.test(t)) return true;
+  // Ends with obvious "more coming" cues → definitely incomplete.
+  if (/\b(and|or|but|so|because|with|to|for|of|in|on|at|the|a|an|my|your|is|are|was|were|i|we|he|she|they|it|um|uh|like|that|this|then|if|when|where)$/i.test(t)) return false;
+  // Ends with comma / semicolon → incomplete.
+  if (/[,;:]$/.test(t)) return false;
+  // Very short and no terminal punctuation — probably incomplete (e.g. "hello", "yes",
+  // "the Ford Focus"). Short direct answers like "yes" are explicitly allowed.
+  const words = t.split(/\s+/).length;
+  if (words <= 2 && /^(yes|yeah|yep|no|nope|ok|okay|sure|right|correct)\b/i.test(t)) return true;
+  // Longer fragments without terminal punctuation are ambiguous — let the LLM decide.
+  return null; // null means "ask the LLM"
+}
+
+// LLM-based end-of-turn check. Fast, cheap, called only when the local
+// heuristic is ambiguous. Returns true if the caller has finished speaking.
+async function isTurnComplete(session, fullUtterance) {
+  if (!openai) return true;
+  try {
+    const t0 = Date.now();
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      max_tokens: 10,
+      messages: [
+        { role: 'system', content:
+          `You decide whether a caller in a live phone conversation has finished speaking. ` +
+          `Given their most recent utterance, reply with ONLY the single word "complete" if they sound like they have finished their thought and are waiting for a reply, ` +
+          `or "incomplete" if they are mid-sentence, mid-list, or about to continue. ` +
+          `Short direct questions or answers are complete. Trailing conjunctions, unfinished clauses, or mid-list pauses are incomplete.`
+        },
+        { role: 'user', content: fullUtterance }
+      ],
+    });
+    const out = (resp.choices[0]?.message?.content || '').toLowerCase().trim();
+    const complete = out.startsWith('complete');
+    log('info', 'openai', `turn-complete check "${fullUtterance.slice(0, 60)}" → ${out} (${Date.now() - t0}ms)`,
+      { session_id: session.id });
+    return complete;
+  } catch (e) {
+    log('warn', 'openai', `turn-complete check failed: ${e.message} — defaulting to complete`, { session_id: session.id });
+    return true;
+  }
+}
+
+// Core entry point for every committed utterance from STT.
+//
+// Behaviour:
+//   1. If the AI is currently speaking, this means the caller barged in.
+//      Playback has already been aborted by the partial_transcript handler.
+//      We buffer this utterance and wait for the current turn to drain.
+//   2. Accumulate utterance fragments into pendingUtterance.
+//   3. Decide end-of-turn: heuristic first, LLM fallback on ambiguous cases.
+//      If incomplete, open a grace window (3s) waiting for more fragments.
+//      Each new fragment resets the window.
+//   4. Once complete, flush the accumulated text to the AI.
+//   5. Multiple fragments that arrive while the AI is thinking/speaking are
+//      queued; they are processed as a single coalesced utterance after the
+//      AI finishes (or after a barge-in flushes them).
+function handleCommittedUtterance(session, text) {
+  session.pendingUtterance = (session.pendingUtterance || '');
+  session.pendingUtterance = session.pendingUtterance
+    ? `${session.pendingUtterance} ${text}`
+    : text;
+  session.pendingUtterance = session.pendingUtterance.replace(/\s+/g, ' ').trim();
+
+  // If a grace window is already open, reset it; more fragments just arrived.
+  if (session.pendingTimer) {
+    clearTimeout(session.pendingTimer);
+    session.pendingTimer = null;
+  }
+
+  // If the AI is busy (thinking or still speaking), just keep accumulating.
+  // When the current turn finishes, the finisher will call flushPendingUtterance.
   if (session.turn !== 'idle') {
-    log('warn', 'openai', `processCallerInput discarded — turn=${session.turn}`, { session_id: session.id });
+    log('info', 'openai', `buffering utterance while turn=${session.turn}: "${session.pendingUtterance}"`,
+      { session_id: session.id });
+    return;
+  }
+
+  decideAndMaybeFlush(session);
+}
+
+async function decideAndMaybeFlush(session) {
+  const utter = (session.pendingUtterance || '').trim();
+  if (!utter) return;
+
+  // Fast local heuristic first.
+  const h = looksComplete(utter);
+  if (h === true) {
+    return flushPendingUtterance(session);
+  }
+  if (h === false) {
+    // Clearly incomplete — open a grace window and wait for more.
+    log('info', 'openai', `utterance looks incomplete, waiting for continuation: "${utter}"`,
+      { session_id: session.id });
+    session.pendingTimer = setTimeout(() => {
+      session.pendingTimer = null;
+      // Timed out — even if it still looks incomplete, go with what we have.
+      flushPendingUtterance(session);
+    }, 3000);
+    return;
+  }
+
+  // Ambiguous — ask the LLM.
+  const complete = await isTurnComplete(session, utter);
+  if (complete) {
+    return flushPendingUtterance(session);
+  }
+  log('info', 'openai', `LLM says incomplete, waiting for continuation: "${utter}"`, { session_id: session.id });
+  session.pendingTimer = setTimeout(() => {
+    session.pendingTimer = null;
+    flushPendingUtterance(session);
+  }, 3000);
+}
+
+async function flushPendingUtterance(session) {
+  const utter = (session.pendingUtterance || '').trim();
+  if (!utter) return;
+  if (session.turn !== 'idle') {
+    // Something changed while we were deciding. Leave it buffered;
+    // speakToCaller's finally block will retry the flush.
+    return;
+  }
+  session.pendingUtterance = '';
+  if (session.pendingTimer) { clearTimeout(session.pendingTimer); session.pendingTimer = null; }
+  await runTurn(session, utter);
+}
+
+async function runTurn(session, userText) {
+  if (session.turn !== 'idle') {
+    log('warn', 'openai', `runTurn discarded — turn=${session.turn}`, { session_id: session.id });
     return;
   }
   session.turn = 'thinking';
@@ -519,11 +660,8 @@ async function processCallerInput(session, userText) {
   persistCall(session);
 
   try {
-    // Step 1: push the new caller utterance onto history so the identifier call sees it.
+    // Identify car if not yet matched.
     session.history.push({ role: 'user', content: userText });
-
-    // Step 2: if we haven't locked a car in yet, try to identify one from the
-    // full transcript against the inventory. This runs every turn until matched.
     if (!session.matchedCar) {
       const identified = await identifyCarFromTranscript(session);
       if (identified) {
@@ -531,13 +669,8 @@ async function processCallerInput(session, userText) {
         broadcast({ type: 'session', session: serializeSession(session) });
       }
     }
-
-    // Step 3: generate the reply with full inventory context (either the
-    // matched car's fact sheet, or the full inventory summary if still
-    // unmatched). generateReply pushes the assistant reply onto history.
-    // NOTE: we already pushed the user turn above, so we pop it here because
-    // generateReply pushes it again. Keeps history clean.
     session.history.pop();
+
     const reply = await generateReply(session, userText);
 
     const ts = new Date().toISOString();
@@ -547,9 +680,17 @@ async function processCallerInput(session, userText) {
 
     await speakToCaller(session, reply);
   } catch (e) {
-    log('error', 'openai', `processCallerInput failed: ${e.message}`, { session_id: session.id });
+    log('error', 'openai', `runTurn failed: ${e.message}`, { session_id: session.id });
+  } finally {
     session.turn = 'idle';
     broadcast({ type: 'session', session: serializeSession(session) });
+
+    // If fragments accumulated during this turn (barge-in, or utterances
+    // committed while we were busy), process them now.
+    if ((session.pendingUtterance || '').trim()) {
+      // Give the caller a brief moment in case they're still mid-fragment.
+      setTimeout(() => decideAndMaybeFlush(session), 100);
+    }
   }
 }
 
@@ -621,12 +762,25 @@ async function openElevenStream(session) {
     return;
   }
   try {
+    // VAD settings tuned for natural conversational pauses. The caller can
+    // hesitate, take a breath, or think mid-sentence without the AI cutting in.
+    // - vad_silence_threshold_secs=1.4: wait 1.4s of silence before committing
+    //   (up from 0.6s). Gives the caller room to think between clauses.
+    // - min_speech_duration_ms=250: ignore transient noise shorter than 250ms.
+    // - min_silence_duration_ms=400: silence inside a phrase needs to be at
+    //   least 400ms to count toward the commit threshold; shorter pauses
+    //   (natural speech rhythm) don't reset anything.
+    // - vad_threshold=0.5: slightly less sensitive than default 0.4 so
+    //   background noise / line hiss doesn't count as speech.
     const qs = new URLSearchParams({
       model_id: 'scribe_v2_realtime',
       audio_format: 'pcm_16000',
       language_code: 'en',
       commit_strategy: 'vad',
-      vad_silence_threshold_secs: '0.6',
+      vad_silence_threshold_secs: '1.4',
+      vad_threshold: '0.5',
+      min_speech_duration_ms: '250',
+      min_silence_duration_ms: '400',
     }).toString();
 
     const elevenWS = new WebSocket(
@@ -640,7 +794,6 @@ async function openElevenStream(session) {
 
     elevenWS.on('open', () => {
       log('info', 'elevenlabs', 'STT WebSocket opened', { session_id: session.id });
-      // Flush buffered audio as JSON input_audio_chunk messages
       session.sttReady = true;
       const queued = session.sttPending || [];
       session.sttPending = null;
@@ -666,6 +819,16 @@ async function openElevenStream(session) {
           if (!text) break;
           session.interim = text;
           broadcast({ type: 'interim', call_id: session.id, text });
+
+          // Barge-in: if the AI is currently speaking and the caller starts
+          // saying something substantive, stop the AI immediately so we don't
+          // talk over each other. We wait for a meaningful partial (>=3 chars,
+          // at least one real word) before aborting to avoid false triggers
+          // from line hiss or faint residual echo.
+          if (session.turn === 'speaking' && text.length >= 3 && /\b\w{2,}\b/.test(text)) {
+            log('info', 'tts', `barge-in detected ("${text}") — aborting AI playback`, { session_id: session.id });
+            session.playbackAborted = true;
+          }
           break;
         }
 
@@ -676,14 +839,11 @@ async function openElevenStream(session) {
           broadcast({ type: 'interim', call_id: session.id, text: '' });
           if (text.length < 2) break;
           log('info', 'elevenlabs', `committed: "${text}"`, { session_id: session.id });
-          processCallerInput(session, text).catch((e) =>
-            log('error', 'openai', `processCallerInput error: ${e.message}`, { session_id: session.id })
-          );
+          handleCommittedUtterance(session, text);
           break;
         }
 
         default:
-          // Error payloads from Scribe have a message_type ending in _error
           if (typeof data.message_type === 'string' && data.message_type.endsWith('_error')) {
             log('error', 'elevenlabs',
               `STT ${data.message_type}: ${data.message || data.error || JSON.stringify(data)}`,
@@ -898,6 +1058,8 @@ function handleVonageWS(ws, req, url) {
     interim: '',
     playbackAborted: false,
     finalized: false,
+    pendingUtterance: '',
+    pendingTimer: null,
   };
   sessions.set(callId, session);
   log('info', 'websocket', `Vonage WS connected from=${from} conv=${conversation_uuid}`, { session_id: callId });
@@ -908,8 +1070,12 @@ function handleVonageWS(ws, req, url) {
 
   ws.on('message', (data, isBinary) => {
     if (isBinary) {
-      // Echo gate: drop inbound frames while AI is speaking
-      if (session.turn === 'speaking') return;
+      // Forward audio to STT at all times so we can detect barge-in while
+      // the AI is speaking. The TTS output does come back on this same
+      // Vonage WebSocket as inbound echo, but the barge-in handler only
+      // triggers on meaningful partials (>=3 chars with a real word), which
+      // filters out most spurious echo. If echo feedback becomes a problem
+      // in practice, we can re-introduce a selective gate here.
       forwardAudioToEleven(session, data);
     } else {
       // Vonage may send JSON control messages — log them
@@ -921,6 +1087,7 @@ function handleVonageWS(ws, req, url) {
   ws.on('close', () => {
     log('info', 'websocket', `Vonage WS closed`, { session_id: callId });
     session.playbackAborted = true;
+    if (session.pendingTimer) { clearTimeout(session.pendingTimer); session.pendingTimer = null; }
     if (session.elevenWS && session.elevenWS.readyState === WebSocket.OPEN) {
       try { session.elevenWS.close(); } catch {}
     }
