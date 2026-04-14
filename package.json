@@ -13,7 +13,6 @@
     "express": "^4.19.2",
     "ws": "^8.17.0",
     "dotenv": "^16.4.5",
-    "openai": "^4.52.0",
-    "@elevenlabs/elevenlabs-js": "^2.0.0"
+    "openai": "^4.52.0"
   }
 }
