@@ -8,7 +8,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
 const OpenAI = require('openai');
-const { ElevenLabsClient } = require('@elevenlabs/elevenlabs-js');
 
 // ---------------------------------------------------------------------------
 // Config
@@ -24,7 +23,6 @@ const CALLS_FILE = path.join(DATA_DIR, 'calls.json');
 const LEADS_FILE = path.join(DATA_DIR, 'leads.json');
 
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-const eleven = ELEVEN_LABS_API_KEY ? new ElevenLabsClient({ apiKey: ELEVEN_LABS_API_KEY }) : null;
 
 // ---------------------------------------------------------------------------
 // In-memory state
@@ -441,81 +439,102 @@ async function finalizeCall(session) {
 
 // ---------------------------------------------------------------------------
 // ElevenLabs streaming STT per session
+//
+// Uses the Realtime Scribe v2 WebSocket API:
+//   wss://api.elevenlabs.io/v1/speech-to-text/realtime
+// - Auth: xi-api-key header
+// - Audio chunks: JSON { message_type: "input_audio_chunk", audio_base_64: "..." }
+// - Responses: partial_transcript (interim) + committed_transcript (final)
+// - VAD commit strategy with 0.6s silence threshold handles the 600ms endpointing
+//   requirement natively; no manual debounce needed on the server side.
 // ---------------------------------------------------------------------------
 async function openElevenStream(session) {
-  if (!eleven) {
+  if (!ELEVEN_LABS_API_KEY) {
     log('error', 'elevenlabs', 'ELEVEN_LABS_API_KEY not configured', { session_id: session.id });
     return;
   }
   try {
-    // Use direct WebSocket to ElevenLabs realtime STT API to avoid SDK version drift.
+    const qs = new URLSearchParams({
+      model_id: 'scribe_v2_realtime',
+      audio_format: 'pcm_16000',
+      language_code: 'en',
+      commit_strategy: 'vad',
+      vad_silence_threshold_secs: '0.6',
+    }).toString();
+
     const elevenWS = new WebSocket(
-      'wss://api.elevenlabs.io/v1/speech-to-text/stream?model_id=scribe_v1&language_code=en',
+      `wss://api.elevenlabs.io/v1/speech-to-text/realtime?${qs}`,
       { headers: { 'xi-api-key': ELEVEN_LABS_API_KEY } }
     );
 
     session.elevenWS = elevenWS;
-    session.sttPending = [];
+    session.sttReady = false;
+    session.sttPending = []; // buffer of raw PCM Buffers until socket is open
 
     elevenWS.on('open', () => {
-      log('info', 'elevenlabs', 'STT stream open', { session_id: session.id });
-      try {
-        elevenWS.send(JSON.stringify({
-          type: 'config',
-          encoding: 'linear16',
-          sample_rate: 16000,
-          channels: 1,
-          endpointing: 300,
-        }));
-      } catch (e) {
-        log('warn', 'elevenlabs', `config send failed: ${e.message}`, { session_id: session.id });
-      }
-      // Flush any buffered frames
-      for (const f of session.sttPending) {
-        try { elevenWS.send(f, { binary: true }); } catch {}
-      }
+      log('info', 'elevenlabs', 'STT WebSocket opened', { session_id: session.id });
+      // Flush buffered audio as JSON input_audio_chunk messages
+      session.sttReady = true;
+      const queued = session.sttPending || [];
       session.sttPending = null;
+      for (const pcm of queued) sendAudioChunkToEleven(session, pcm);
     });
 
     elevenWS.on('message', (msg, isBinary) => {
       if (isBinary) return;
       let data;
       try { data = JSON.parse(msg.toString()); }
-      catch { return; }
-
-      // Normalize transcript shape across variants
-      const text = (data.text || data.transcript || (data.alternatives && data.alternatives[0]?.text) || '').trim();
-      if (!text) return;
-      const isFinal = data.is_final === true || data.type === 'final' || data.final === true;
-
-      if (!isFinal) {
-        session.interim = text;
-        broadcast({ type: 'interim', call_id: session.id, text });
+      catch (e) {
+        log('warn', 'elevenlabs', `non-JSON message from STT: ${e.message}`, { session_id: session.id });
         return;
       }
 
-      session.interim = '';
-      broadcast({ type: 'interim', call_id: session.id, text: '' });
+      switch (data.message_type) {
+        case 'session_started':
+          log('info', 'elevenlabs', `STT session_started id=${data.session_id}`, { session_id: session.id });
+          break;
 
-      // Debounce 600ms of silence after final before processing
-      if (session.silenceTimer) clearTimeout(session.silenceTimer);
-      session.pendingFinal = (session.pendingFinal ? session.pendingFinal + ' ' : '') + text;
-      session.silenceTimer = setTimeout(() => {
-        const utter = (session.pendingFinal || '').trim();
-        session.pendingFinal = '';
-        if (utter.length >= 2) {
-          processCallerInput(session, utter).catch((e) =>
+        case 'partial_transcript': {
+          const text = (data.text || '').trim();
+          if (!text) break;
+          session.interim = text;
+          broadcast({ type: 'interim', call_id: session.id, text });
+          break;
+        }
+
+        case 'committed_transcript':
+        case 'committed_transcript_with_timestamps': {
+          const text = (data.text || '').trim();
+          session.interim = '';
+          broadcast({ type: 'interim', call_id: session.id, text: '' });
+          if (text.length < 2) break;
+          log('info', 'elevenlabs', `committed: "${text}"`, { session_id: session.id });
+          processCallerInput(session, text).catch((e) =>
             log('error', 'openai', `processCallerInput error: ${e.message}`, { session_id: session.id })
           );
+          break;
         }
-      }, 600);
+
+        default:
+          // Error payloads from Scribe have a message_type ending in _error
+          if (typeof data.message_type === 'string' && data.message_type.endsWith('_error')) {
+            log('error', 'elevenlabs',
+              `STT ${data.message_type}: ${data.message || data.error || JSON.stringify(data)}`,
+              { session_id: session.id });
+          } else {
+            log('info', 'elevenlabs', `STT event ${data.message_type || 'unknown'}`, { session_id: session.id });
+          }
+      }
     });
 
     elevenWS.on('error', (e) => {
-      log('error', 'elevenlabs', `STT error: ${e.message}`, { session_id: session.id });
+      log('error', 'elevenlabs', `STT WebSocket error: ${e.message}`, { session_id: session.id });
     });
-    elevenWS.on('close', () => {
-      log('info', 'elevenlabs', 'STT stream closed', { session_id: session.id });
+    elevenWS.on('close', (code, reason) => {
+      const reasonStr = reason ? reason.toString() : '';
+      log('info', 'elevenlabs', `STT WebSocket closed code=${code}${reasonStr ? ' reason=' + reasonStr : ''}`,
+        { session_id: session.id });
+      session.sttReady = false;
       session.elevenWS = null;
     });
   } catch (e) {
@@ -523,15 +542,27 @@ async function openElevenStream(session) {
   }
 }
 
+function sendAudioChunkToEleven(session, pcmBuffer) {
+  const ws = session.elevenWS;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try {
+    const msg = JSON.stringify({
+      message_type: 'input_audio_chunk',
+      audio_base_64: pcmBuffer.toString('base64'),
+    });
+    ws.send(msg);
+  } catch (e) {
+    log('warn', 'elevenlabs', `audio chunk send failed: ${e.message}`, { session_id: session.id });
+  }
+}
+
 function forwardAudioToEleven(session, frame) {
   if (!session.elevenWS) return;
-  if (session.elevenWS.readyState === WebSocket.CONNECTING) {
+  if (!session.sttReady) {
     if (session.sttPending) session.sttPending.push(frame);
     return;
   }
-  if (session.elevenWS.readyState !== WebSocket.OPEN) return;
-  try { session.elevenWS.send(frame, { binary: true }); }
-  catch (e) { log('warn', 'elevenlabs', `forward send failed: ${e.message}`, { session_id: session.id }); }
+  sendAudioChunkToEleven(session, frame);
 }
 
 // ---------------------------------------------------------------------------
@@ -691,13 +722,12 @@ function handleVonageWS(ws, req, url) {
     ended_at: null,
     ws,
     elevenWS: null,
+    sttReady: false,
     sttPending: [],
     transcript: [],
     history: [],
     matchedCar: null,
     interim: '',
-    pendingFinal: '',
-    silenceTimer: null,
     playbackAborted: false,
     finalized: false,
   };
@@ -723,7 +753,6 @@ function handleVonageWS(ws, req, url) {
   ws.on('close', () => {
     log('info', 'websocket', `Vonage WS closed`, { session_id: callId });
     session.playbackAborted = true;
-    if (session.silenceTimer) clearTimeout(session.silenceTimer);
     if (session.elevenWS && session.elevenWS.readyState === WebSocket.OPEN) {
       try { session.elevenWS.close(); } catch {}
     }
